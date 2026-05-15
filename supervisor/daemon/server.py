@@ -479,6 +479,7 @@ class DaemonServer:
                     mode=self.config.pause_handling_mode,
                     max_auto_interventions=self.config.max_auto_interventions,
                 ),
+                runtime_recovery_policy=self.config.runtime_recovery_policy(),
             )
             loop.run_sidecar(
                 spec, state, terminal,

@@ -18,6 +18,15 @@ _GLOBAL_INHERITABLE = frozenset({
     "judge_temperature", "judge_max_tokens", "worker_trust_level",
     "notification_channels", "pause_handling_mode", "max_auto_interventions",
     "poll_interval_sec", "read_lines",
+    "runtime_recovery_enabled", "runtime_recovery_profile",
+    "runtime_recovery_reset_timezone", "runtime_recovery_reset_grace_seconds",
+    "runtime_recovery_transient_delay_seconds",
+    "runtime_recovery_rate_limit_fallback_delay_seconds",
+    "runtime_recovery_quiet_windows", "runtime_recovery_max_attempts_per_run",
+    "provider_retry_enabled", "provider_retry_reset_timezone",
+    "provider_retry_reset_grace_seconds", "provider_retry_transient_delay_seconds",
+    "provider_retry_rate_limit_fallback_delay_seconds",
+    "provider_retry_skip_windows", "provider_retry_max_attempts_per_run",
     "explainer_model", "explainer_temperature", "explainer_max_tokens",
     "deep_explainer_model", "deep_explainer_temperature", "deep_explainer_max_tokens",
     "clarification_escalation_confidence",
@@ -78,11 +87,18 @@ def coerce_config_value(key: str, value: str):
     ftype = known[key].type
     if value.lower() in ("null", "none", "~"):
         return None
-    if ftype in ("float", float):
+    if _field_accepts(ftype, "float", float):
         return float(value)
-    if ftype in ("int", int):
+    if _field_accepts(ftype, "int", int):
         return int(value)
+    if _field_accepts(ftype, "bool", bool):
+        return value.lower() in ("1", "true", "yes", "on")
     return value
+
+
+def _field_accepts(ftype, type_name: str, pytype) -> bool:
+    text = str(ftype)
+    return ftype in (type_name, pytype) or type_name in text
 
 
 @dataclass
@@ -139,6 +155,25 @@ class RuntimeConfig:
     branch_confidence_threshold: float = 0.75
     default_agent_timeout_sec: int = 300
 
+    # -- Runtime recovery --
+    runtime_recovery_enabled: bool | None = None
+    runtime_recovery_profile: str | None = None
+    runtime_recovery_reset_timezone: str | None = None
+    runtime_recovery_reset_grace_seconds: int | None = None
+    runtime_recovery_transient_delay_seconds: int | None = None
+    runtime_recovery_rate_limit_fallback_delay_seconds: int | None = None
+    runtime_recovery_quiet_windows: list[str] | None = None
+    runtime_recovery_max_attempts_per_run: int | None = None
+
+    # Back-compat aliases for configs written during the initial provider-retry rollout.
+    provider_retry_enabled: bool = True
+    provider_retry_reset_timezone: str = "Asia/Shanghai"
+    provider_retry_reset_grace_seconds: int = 60
+    provider_retry_transient_delay_seconds: int = 60
+    provider_retry_rate_limit_fallback_delay_seconds: int = 300
+    provider_retry_skip_windows: list[str] = field(default_factory=list)
+    provider_retry_max_attempts_per_run: int = 3
+
     # -- Notifications --
     notification_channels: list[dict] = field(default_factory=lambda: [
         {"kind": "tmux_display"},
@@ -171,10 +206,12 @@ class RuntimeConfig:
             if field_name not in known:
                 continue
             ftype = known[field_name].type
-            if ftype in ("float", float):
+            if _field_accepts(ftype, "float", float):
                 data[field_name] = float(val)
-            elif ftype in ("int", int):
+            elif _field_accepts(ftype, "int", int):
                 data[field_name] = int(val)
+            elif _field_accepts(ftype, "bool", bool):
+                data[field_name] = val.lower() in ("1", "true", "yes", "on")
             else:
                 data[field_name] = val
         return cls(**data)
@@ -216,10 +253,12 @@ class RuntimeConfig:
             if field_name not in known:
                 continue
             ftype = known[field_name].type
-            if ftype in ("float", float):
+            if _field_accepts(ftype, "float", float):
                 setattr(base, field_name, float(val))
-            elif ftype in ("int", int):
+            elif _field_accepts(ftype, "int", int):
                 setattr(base, field_name, int(val))
+            elif _field_accepts(ftype, "bool", bool):
+                setattr(base, field_name, val.lower() in ("1", "true", "yes", "on"))
             else:
                 setattr(base, field_name, val)
         return base
@@ -232,6 +271,52 @@ class RuntimeConfig:
     def effective_target(self) -> str:
         """Resolve the effective surface target (surface_target > pane_target)."""
         return self.surface_target or self.pane_target
+
+    def runtime_recovery_policy(self):
+        from supervisor.runtime_recovery import RuntimeRecoveryPolicy, policy_with_profile
+
+        defaults = RuntimeConfig()
+        windows = (
+            self.runtime_recovery_quiet_windows
+            if self.runtime_recovery_quiet_windows is not None
+            else self.provider_retry_skip_windows
+        )
+        if isinstance(windows, str):
+            windows = [item.strip() for item in windows.split(",") if item.strip()]
+        return policy_with_profile(RuntimeRecoveryPolicy(
+            enabled=(
+                self.runtime_recovery_enabled
+                if self.runtime_recovery_enabled is not None
+                else self.provider_retry_enabled
+            ),
+            profile=self.runtime_recovery_profile or "",
+            reset_timezone=(
+                self.runtime_recovery_reset_timezone
+                if self.runtime_recovery_reset_timezone is not None
+                else self.provider_retry_reset_timezone
+            ),
+            reset_grace_seconds=(
+                self.provider_retry_reset_grace_seconds
+                if self.runtime_recovery_reset_grace_seconds is None
+                else self.runtime_recovery_reset_grace_seconds
+            ),
+            transient_delay_seconds=(
+                self.provider_retry_transient_delay_seconds
+                if self.runtime_recovery_transient_delay_seconds is None
+                else self.runtime_recovery_transient_delay_seconds
+            ),
+            rate_limit_fallback_delay_seconds=(
+                self.provider_retry_rate_limit_fallback_delay_seconds
+                if self.runtime_recovery_rate_limit_fallback_delay_seconds is None
+                else self.runtime_recovery_rate_limit_fallback_delay_seconds
+            ),
+            quiet_windows=tuple(windows or ()),
+            max_attempts_per_run=(
+                self.provider_retry_max_attempts_per_run
+                if self.runtime_recovery_max_attempts_per_run is None
+                else self.runtime_recovery_max_attempts_per_run
+            ),
+        ))
 
     def default_config_yaml(self) -> str:
         """Render a commented YAML template suitable for ``init``."""
@@ -252,6 +337,19 @@ class RuntimeConfig:
             f"worker_model: \"{self.worker_model}\"\n"
             "# trust: low | standard | high (high = minimal supervision)\n"
             f"worker_trust_level: \"{self.worker_trust_level}\"\n"
+            "\n"
+            "# Runtime recovery: orthogonal to workflow steps; retries provider/connectivity failures.\n"
+            f"runtime_recovery_enabled: {str(self.runtime_recovery_enabled if self.runtime_recovery_enabled is not None else True).lower()}\n"
+            "# Optional preset profile. Example: \"glm\" reserves UTC+8 12:00-18:00 and uses 5h fallback.\n"
+            f"runtime_recovery_profile: \"{self.runtime_recovery_profile or ''}\"\n"
+            "# Naive reset timestamps in Chinese Claude/GLM output are usually UTC+8.\n"
+            f"runtime_recovery_reset_timezone: \"{self.runtime_recovery_reset_timezone or self.provider_retry_reset_timezone}\"\n"
+            f"runtime_recovery_reset_grace_seconds: {self.runtime_recovery_reset_grace_seconds if self.runtime_recovery_reset_grace_seconds is not None else self.provider_retry_reset_grace_seconds}\n"
+            f"runtime_recovery_transient_delay_seconds: {self.runtime_recovery_transient_delay_seconds if self.runtime_recovery_transient_delay_seconds is not None else self.provider_retry_transient_delay_seconds}\n"
+            f"runtime_recovery_rate_limit_fallback_delay_seconds: {self.runtime_recovery_rate_limit_fallback_delay_seconds if self.runtime_recovery_rate_limit_fallback_delay_seconds is not None else self.provider_retry_rate_limit_fallback_delay_seconds}\n"
+            "# Optional quiet windows, e.g. [\"UTC+8 12:00-18:00\"]\n"
+            "runtime_recovery_quiet_windows: []\n"
+            f"runtime_recovery_max_attempts_per_run: {self.runtime_recovery_max_attempts_per_run if self.runtime_recovery_max_attempts_per_run is not None else self.provider_retry_max_attempts_per_run}\n"
             "\n"
             "# LLM judge (set to null for stub/offline mode)\n"
             "# Examples: anthropic/claude-haiku-4-5-20251001, openai/gpt-4o-mini\n"

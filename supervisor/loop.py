@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from datetime import datetime, timezone
 
 from supervisor.domain.enums import DeliveryState, TopState, DecisionType
 from supervisor.domain.models import (
@@ -26,6 +27,12 @@ from supervisor.history import latest_oracle_consultation_id_for_run
 from supervisor.interventions import AutoInterventionManager
 from supervisor.notifications import NotificationEvent, NotificationManager
 from supervisor.pause_summary import PAUSE_CLASSES, latest_human_escalation, summarize_state
+from supervisor.runtime_recovery import (
+    RuntimeRecoveryObservation,
+    RuntimeRecoveryPolicy,
+    detect_runtime_recovery,
+    seconds_until_recovery,
+)
 from supervisor.progress import write_progress
 from supervisor.protocol.reason_code import (
     ESC_AUTHORIZATION_REQUIRED,
@@ -82,7 +89,8 @@ class SupervisorLoop:
                  judge_temperature: float = 0.1, judge_max_tokens: int = 512,
                  worker_profile: WorkerProfile | None = None,
                  notification_manager: NotificationManager | None = None,
-                 auto_intervention_manager: AutoInterventionManager | None = None):
+                 auto_intervention_manager: AutoInterventionManager | None = None,
+                 runtime_recovery_policy: RuntimeRecoveryPolicy | None = None):
         self.store = store
         self.judge_client = JudgeClient(
             model=judge_model,
@@ -98,6 +106,7 @@ class SupervisorLoop:
         self.worker_profile = worker_profile or WorkerProfile()
         self.notification_manager = notification_manager or NotificationManager()
         self.auto_intervention_manager = auto_intervention_manager or AutoInterventionManager(mode="notify_only")
+        self.runtime_recovery_policy = runtime_recovery_policy or RuntimeRecoveryPolicy()
         # Set while a sidecar loop is active; consulted by helpers that need
         # to cooperate with daemon stop_event / SIGTERM.
         self._interrupted_ref = None
@@ -904,6 +913,11 @@ class SupervisorLoop:
             effective_idle_timeout_sec = ZERO_POLL_IDLE_TIMEOUT_SEC
         pending_text = None
         last_activity_at = time.monotonic()
+        recovery_attempts: dict[str, int] = {}
+        recovery_total_attempts = 0
+        scheduled_recovery: RuntimeRecoveryObservation | None = None
+        scheduled_recovery_signature = ""
+        exhausted_recovery_signatures: set[str] = set()
         # Delivery ack: transient monotonic time of last injection (not persisted)
         delivery_ack_deadline = 0.0  # 0 = not awaiting ack
         DELIVERY_ACK_TIMEOUT = 60  # seconds
@@ -1041,6 +1055,79 @@ class SupervisorLoop:
             # 2. Parse checkpoint with identity
             checkpoints = adapter.parse_checkpoints(text, run_id=state.run_id, surface_id=surface_id)
             if not checkpoints:
+                wall_clock_now = datetime.now(timezone.utc)
+                recovery = detect_runtime_recovery(
+                    text,
+                    now=wall_clock_now,
+                    policy=self.runtime_recovery_policy,
+                )
+                if recovery is not None:
+                    if recovery_total_attempts < self.runtime_recovery_policy.max_attempts_per_run:
+                        if scheduled_recovery is None or scheduled_recovery_signature != recovery.signature:
+                            scheduled_recovery = recovery
+                            scheduled_recovery_signature = recovery.signature
+                            self.store.append_session_event(
+                                state.run_id,
+                                "runtime_recovery_scheduled",
+                                {
+                                    "kind": recovery.kind,
+                                    "reason": recovery.reason,
+                                    "retry_at": recovery.retry_at.isoformat(),
+                                    "attempt": recovery_total_attempts + 1,
+                                    "max_attempts": self.runtime_recovery_policy.max_attempts_per_run,
+                                },
+                            )
+                            self.store.save(state)
+                    elif recovery.signature not in exhausted_recovery_signatures:
+                        exhausted_recovery_signatures.add(recovery.signature)
+                        self.store.append_session_event(
+                            state.run_id,
+                            "runtime_recovery_exhausted",
+                            {
+                                "kind": recovery.kind,
+                                "reason": recovery.reason,
+                                "attempts": recovery_total_attempts,
+                                "max_attempts": self.runtime_recovery_policy.max_attempts_per_run,
+                            },
+                        )
+                        self.store.save(state)
+
+                if (
+                    scheduled_recovery is not None
+                    and seconds_until_recovery(scheduled_recovery.retry_at, now=wall_clock_now) <= 0
+                ):
+                    attempts = recovery_attempts.get(scheduled_recovery.signature, 0)
+                    instruction = self._build_runtime_recovery_instruction(
+                        state, scheduled_recovery
+                    )
+                    state.last_injected_node_id = state.current_node_id
+                    state.last_injected_attempt = state.current_attempt
+                    state.last_injection_seq = state.checkpoint_seq
+                    self.store.save(state)
+                    if not self._inject_or_pause(state, terminal, instruction, spec=spec):
+                        return
+                    recovery_attempts[scheduled_recovery.signature] = attempts + 1
+                    recovery_total_attempts += 1
+                    self.store.append_session_event(
+                        state.run_id,
+                        "runtime_recovery_injected",
+                        {
+                            "kind": scheduled_recovery.kind,
+                            "reason": scheduled_recovery.reason,
+                            "attempt": recovery_total_attempts,
+                            "max_attempts": self.runtime_recovery_policy.max_attempts_per_run,
+                        },
+                    )
+                    scheduled_recovery = None
+                    scheduled_recovery_signature = ""
+                    delivery_ack_deadline = time.monotonic() + DELIVERY_ACK_TIMEOUT
+                    time.sleep(effective_poll_interval)
+                    continue
+
+                if scheduled_recovery is not None:
+                    time.sleep(effective_poll_interval)
+                    continue
+
                 if effective_idle_timeout_sec and effective_idle_timeout_sec > 0:
                     idle_for = now - last_activity_at
                     if idle_for >= effective_idle_timeout_sec:
@@ -1165,6 +1252,8 @@ class SupervisorLoop:
                 if (state.checkpoint_seq > state.last_injection_seq
                         and state.delivery_state not in (DeliveryState.IDLE, DeliveryState.STARTED_PROCESSING)):
                     self._set_delivery_state(state, DeliveryState.STARTED_PROCESSING, reason="checkpoint received")
+                scheduled_recovery = None
+                scheduled_recovery_signature = ""
                 logger.info("checkpoint: %s (id=%s)", checkpoint.summary, checkpoint.checkpoint_id)
                 if checkpoint.status in {"working", "step_done", "workflow_done"}:
                     self._reset_recovery_tracking(state, clear_escalations=False)
@@ -1346,6 +1435,21 @@ class SupervisorLoop:
         if state and state.workspace_root:
             return state.workspace_root
         return None
+
+    def _build_runtime_recovery_instruction(self, state, recovery: RuntimeRecoveryObservation) -> HandoffInstruction:
+        content = (
+            "retry\n\n"
+            "Runtime recovery detected a provider/connectivity failure outside the task logic. "
+            f"Retry the last interrupted action and continue current_node={state.current_node_id}. "
+            f"Observed {recovery.kind}: {recovery.reason}"
+        )
+        return HandoffInstruction.make(
+            content=content,
+            node_id=state.current_node_id,
+            current_attempt=state.current_attempt,
+            triggered_by_decision_id="",
+            trigger_type="runtime_recovery",
+        )
 
     def _wait_for_injection_window(self, state, terminal, *, instruction_id: str) -> tuple[bool, str]:
         readiness_fn = getattr(terminal, "injection_readiness", None)
