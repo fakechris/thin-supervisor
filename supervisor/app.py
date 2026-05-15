@@ -380,6 +380,7 @@ def cmd_run_foreground(args):
                 mode=config.pause_handling_mode,
                 max_auto_interventions=config.max_auto_interventions,
             ),
+            runtime_recovery_policy=config.runtime_recovery_policy(),
         )
 
         print(f"[DEBUG MODE] Foreground controller — for debugging only")
